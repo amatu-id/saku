@@ -1407,7 +1407,7 @@ window.addEventListener('storage', ev => {
   try { const l = JSON.parse(ev.newValue); validate(l); L = l; savedAt = new Date(); if (!ui.locked && !dlg().open) render(); } catch {}
 });
 // ---------- sync between devices (Supabase; one encrypted row per user, realtime broadcast + 15s check) ----------
-const SB_URL = 'https://bbptcxpzzvgpxqylkrmw.supabase.co', SB_KEY = 'sb_publishable_Ny-WHCEZ3WmcLFsPBx9QeQ_9xgo7MxR'; // Supabase project URL + anon (public) key
+const SB_URL = 'https://ieyqxmzztoxgpvwexbkj.supabase.co', SB_KEY = 'sb_publishable_o-PQxhkJJ8FG4mHYTUqEBw_uXv9n-eG'; // Supabase project URL + anon (public) key
 const Sync = { busy: false, again: false, at: null, err: '', rev: null, ch: null, timer: null };
 function syncCfg() { return !!(SB_URL && SB_KEY); }
 function showSync() { document.querySelectorAll('.save-state').forEach(el => { el.textContent = saveText(); }); }
