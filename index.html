@@ -706,6 +706,23 @@ function estimate(l, month, now = new Date()) {
   return { month, end, days, elapsed, actual, real, plans, upcoming, planned, total: real + planned, perDay, pace, avg3, avg3n: past.length, byCat };
 }
 
+// The base of a merge says "this device once had it", so an id in the base that the device does not hold counts as deleted here.
+// A base that cannot be trusted that far (older version where another device's base landed here; or far more missing than a
+// person deletes) only keeps the ids the device still holds: the worst outcome is a deleted entry coming back, never entries lost.
+function trustBase(base, l) {
+  if (!base) return base; const out = { ...base };
+  for (const k of ['wallets', 'categories', 'entries', 'debts', 'plans']) { if (!base[k]) continue; const have = new Set((l[k] || []).map(x => x.id)); out[k] = base[k].filter(x => have.has(x.id)); }
+  return out;
+}
+const baseLost = (base, l) => { if (!base) return 0; const have = new Set((l.entries || []).map(x => x.id)); return (base.entries || []).filter(x => !have.has(x.id)).length; };
+// One device deleted a wallet/category/entry that an entry or a debt of another device still needs: bring it back instead of giving up the merge.
+function repairRefs(m, ...sources) {
+  const find = (k, id) => { for (const s of sources) { const x = s && (s[k] || []).find(y => y.id === id); if (x) return x; } return null; };
+  const need = (k, id) => { if (id == null || m[k].some(x => x.id === id)) return; const x = find(k, id); if (x) m[k].push(x); };
+  for (const d of m.debts || []) for (const p of d.payments || []) need('entries', p.entry);
+  for (const e of m.entries) { need('wallets', e.wallet); if (e.destination) need('wallets', e.destination); if (e.kind !== 'Transfer') need('categories', e.category); }
+  return m;
+}
 function merge3(base, a, b) {
   const s = JSON.stringify, out = { ...b };
   for (const k of Object.keys(a)) if (!Array.isArray(a[k]) && (!base || s(a[k]) !== s(base[k]))) out[k] = a[k];
@@ -728,7 +745,7 @@ function merge3(base, a, b) {
 
 
 // Saku Web — UI
-const BUILD = '20261013-110934';
+const BUILD = '20261104-095033';
 // Phones keep old copies of the page in cache; when a newer build is online, load it (only on the login screen, so nothing is lost).
 async function checkUpdate() {
   try { const r = await fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }); const m = /const BUILD = '([^']+)'/.exec(await r.text());
@@ -786,7 +803,7 @@ function commit(c) {
   validate(c); const old = ls.get(KEY); if (old) ls.set(PREV, old); L = c; persist(); syncSoon();
 }
 function restore(l) { validate(l); if (!l.plans && L?.plans?.length) l.plans = L.plans; // estimates survive restoring an older backup
-  loadFailed = false; commit(l); }
+  loadFailed = false; ls.set('massok', '1'); commit(l); } // a restored backup may really remove many entries
 // Encrypted server copy for this user (data/<id>.json); null when the user has none.
 async function serverLedger(quiet) {
   const r = await fetch(`data/${await Users.fileId(USER)}.json?v=${Date.now()}`, { cache: 'no-store' });
@@ -1404,11 +1421,20 @@ window.addEventListener('focus', tick);
 // Auto update: another tab/window of this browser saved the same book → reload it here.
 window.addEventListener('storage', ev => {
   if (!USER || ev.key !== lk(KEY) || !ev.newValue) return;
-  try { const l = JSON.parse(ev.newValue); validate(l); L = l; savedAt = new Date(); if (!ui.locked && !dlg().open) render(); } catch {}
+  try { const l = JSON.parse(ev.newValue); validate(l); L = l; savedAt = new Date(); Sync.redraw = true; syncDraw(); } catch {}
 });
 // ---------- sync between devices (Supabase; one encrypted row per user, realtime broadcast + 15s check) ----------
 const SB_URL = 'https://ieyqxmzztoxgpvwexbkj.supabase.co', SB_KEY = 'sb_publishable_o-PQxhkJJ8FG4mHYTUqEBw_uXv9n-eG'; // Supabase project URL + anon (public) key
-const Sync = { busy: false, again: false, at: null, err: '', rev: null, ch: null, timer: null };
+const Sync = { busy: false, again: false, at: null, err: '', rev: null, ch: null, timer: null, redraw: false };
+const BASE = 'syncbase2'; // what THIS device last agreed with the server; never leaves the device
+// The merge base. Saved by this version, or else the one of the older version: another device's base could land there, so it is used with care.
+function syncBase() {
+  let b = null; try { b = JSON.parse(ls.get(BASE) || 'null'); } catch {}
+  const mine = !!b; if (!b) try { b = JSON.parse(ls.get('syncbase') || 'null'); } catch {}
+  if (!b) return null;
+  return !mine || (baseLost(b, L) > 20 && !ls.get('massok')) ? trustBase(b, L) : b; // nobody deletes this many entries by hand
+}
+function saveBase(text) { if (!ls.set(BASE, text)) { ls.del(PREV); ls.del('syncbase'); ls.set(BASE, text); } ls.del('syncbase'); ls.del('massok'); }
 function syncCfg() { return !!(SB_URL && SB_KEY); }
 function showSync() { document.querySelectorAll('.save-state').forEach(el => { el.textContent = saveText(); }); }
 function syncSoon() { if (!syncCfg()) return; clearTimeout(Sync.timer); Sync.timer = setTimeout(syncNow, 300); showSync(); }
@@ -1432,35 +1458,47 @@ function syncStop() { if (Sync.ch && sbClient) sbClient.removeChannel(Sync.ch); 
 async function syncNow() {
   if (!USER || !L || loadFailed || !syncCfg()) return;
   if (Sync.busy) { Sync.again = true; return; }
-  const user = USER; Sync.busy = true; showSync(); let changed = false;
+  const user = USER; Sync.busy = true; showSync(); let changed = false, settled = false;
   try {
     const id = await Users.fileId(user);
     for (let tries = 0; tries < 4; tries++) {
-      const dirty = JSON.stringify(L) !== ls.get('syncbase');
-      if (!dirty && Sync.rev !== null && await rpc('book_rev', { p_id: id }) === Sync.rev) break;
+      const dirty = JSON.stringify(L) !== (ls.get(BASE) ?? ls.get('syncbase'));
+      if (!dirty && Sync.rev !== null && await rpc('book_rev', { p_id: id }) === Sync.rev) { settled = true; break; }
       const row = (await rpc('book_get', { p_id: id }))[0]; let remote = null;
+      if (row && !row.data) { await new Promise(r => setTimeout(r, 700)); continue; } // the stored file was just replaced: read the new one
       if (row) { remote = JSON.parse(await Users.decrypt(user, row.data)); validate(remote); }
       if (USER !== user) return;
-      let base = null; try { base = JSON.parse(ls.get('syncbase') || 'null'); } catch {}
+      let base = syncBase();
       if (!base) try { base = await serverLedger(true); } catch {}
-      let merged = remote ? merge3(base, L, remote) : L; try { validate(merged); } catch { merged = L; }
+      if (USER !== user) return;
+      let merged = L;
+      if (remote) { merged = merge3(base, L, remote); try { validate(merged); } catch { repairRefs(merged, L, remote, base); validate(merged); } } // still invalid → stop here, both copies stay as they are
       const text = JSON.stringify(merged); let rev = row ? row.rev : 0;
-      if (text !== JSON.stringify(L)) { L = merged; persist(); changed = true; }
+      if (text !== JSON.stringify(L)) { L = merged; persist(); changed = true; Sync.redraw = true; }
       if (!remote || text !== JSON.stringify(remote)) {
         const nr = await rpc('book_put', { p_id: id, p_data: await Users.encrypt(user, text), p_rev: rev });
         if (nr === -1) continue; // someone saved in between: fetch and merge again
         rev = nr; Sync.ch?.send({ type: 'broadcast', event: 'rev', payload: { rev } });
       }
-      Sync.rev = rev; ls.set('syncbase', text); break;
+      Sync.rev = rev; saveBase(text); settled = true; break;
     }
-    Sync.at = new Date(); Sync.err = '';
+    if (settled) { Sync.at = new Date(); Sync.err = ''; } else { Sync.err = 'belum berhasil, mencoba lagi'; Sync.again = true; }
   } catch (e) { Sync.err = e?.message || String(e); }
   finally { Sync.busy = false; }
-  if (Sync.again) { Sync.again = false; return syncNow(); }
-  if (changed && USER === user && !ui.locked && !dlg().open) render(); else showSync();
+  if (Sync.again) { Sync.again = false; if (settled) return syncNow(); setTimeout(syncNow, 1500); }
+  if (Sync.err) { clearTimeout(Sync.retry); Sync.retry = setTimeout(syncNow, 5000); }
+  syncDraw();
 }
-setInterval(() => { if (!document.hidden) syncNow(); }, 15000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) syncNow(); });
+function syncDraw() { // show what came in; the open dialog gets it when it closes
+  if (Sync.redraw && USER && !ui.locked && !dlg().open) { Sync.redraw = false; render(); } else showSync();
+}
+dlg().addEventListener('close', () => setTimeout(syncDraw, 0));
+setInterval(() => { if (!document.hidden) syncNow(); }, 10000);
+function wakeSync() { if (document.hidden) return; syncNow(); if (USER && !dlg().open && !Sync.busy && Date.now() - lastUpdateCheck > 600000) { lastUpdateCheck = Date.now(); checkUpdate(); } }
+let lastUpdateCheck = Date.now();
+document.addEventListener('visibilitychange', wakeSync);
+window.addEventListener('focus', wakeSync);
+window.addEventListener('pageshow', wakeSync);
 window.addEventListener('online', () => syncNow());
 boot();
 </script>
