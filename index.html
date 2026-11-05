@@ -743,9 +743,39 @@ function merge3(base, a, b) {
   return out;
 }
 
+// What one save changed, record by record: { k, id, v } (v null = deleted) and { f, v } for the plain ledger fields.
+const SYNC_LISTS = ['wallets', 'categories', 'entries', 'debts', 'plans'];
+function diffLedger(a, b) {
+  const s = JSON.stringify, out = [];
+  for (const k of SYNC_LISTS) {
+    const A = new Map((a?.[k] || []).map(x => [x.id, x])), B = new Map((b?.[k] || []).map(x => [x.id, x]));
+    for (const [id, x] of B) if (s(x) !== s(A.get(id))) out.push({ k, id, v: x });
+    for (const id of A.keys()) if (!B.has(id)) out.push({ k, id, v: null });
+  }
+  for (const f of new Set([...Object.keys(a || {}), ...Object.keys(b || {})])) {
+    if (SYNC_LISTS.includes(f) || f === 'opseq') continue;
+    if (s(a?.[f]) !== s(b?.[f])) out.push({ f, v: b?.[f] ?? null });
+  }
+  return out;
+}
+const changeKey = c => c.f ? '$' + c.f : c.k + ':' + c.id;
+// Apply changes in order. skip = changes this device has not sent yet: they will land later and win everywhere.
+function applyOps(l, changes, skip) {
+  const out = { ...l }, maps = {};
+  for (const c of changes) {
+    if (skip?.has(changeKey(c))) continue;
+    if (c.f) { if (c.v == null) delete out[c.f]; else out[c.f] = c.v; continue; }
+    if (!SYNC_LISTS.includes(c.k)) continue;
+    const m = maps[c.k] ||= new Map((out[c.k] || []).map(x => [x.id, x]));
+    if (c.v == null) m.delete(c.id); else m.set(c.id, c.v);
+  }
+  for (const k of Object.keys(maps)) out[k] = [...maps[k].values()];
+  return out;
+}
+
 
 // Saku Web — UI
-const BUILD = '20261104-095033';
+const BUILD = '20261105-183941';
 // Phones keep old copies of the page in cache; when a newer build is online, load it (only on the login screen, so nothing is lost).
 async function checkUpdate() {
   try { const r = await fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }); const m = /const BUILD = '([^']+)'/.exec(await r.text());
@@ -795,12 +825,12 @@ const ui = {
 
 // ---------- storage ----------
 let savedAt = null;
-function persist() { if (!ls.set(KEY, JSON.stringify(L))) { savedAt = null; ui.msg = 'Gagal menyimpan di browser (penyimpanan penuh/diblokir). Segera simpan backup.'; return; } savedAt = new Date(); try { navigator.storage?.persist?.(); } catch {} }
+function persist() { const text = JSON.stringify(L); if (!ls.set(KEY, text) && (ls.del(PREV), !ls.set(KEY, text))) { savedAt = null; ui.msg = 'Gagal menyimpan di browser (penyimpanan penuh/diblokir). Segera simpan backup.'; return; } savedAt = new Date(); try { navigator.storage?.persist?.(); } catch {} }
 const hms = d => [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
-const saveText = () => USER && syncCfg() ? (Sync.err ? '⚠ Sinkron gagal: ' + Sync.err : Sync.busy || Sync.again ? '⏳ Menyinkronkan…' : Sync.at ? '☁ Tersinkron ' + hms(Sync.at) : '☁ Sinkron aktif') : savedAt ? '✓ Tersimpan otomatis ' + [savedAt.getHours(), savedAt.getMinutes(), savedAt.getSeconds()].map(n => String(n).padStart(2, '0')).join(':') : '💾 Tersimpan otomatis di browser ini';
+const saveText = () => USER && syncCfg() ? (Sync.err ? (qGet().box?.length ? `⏳ ${qGet().box.length} perubahan menunggu koneksi` : '⚠ Sinkron gagal: ' + Sync.err) : qGet().box?.length ? '⏳ Mengirim…' : Sync.busy || Sync.again ? '⏳ Menyinkronkan…' : Sync.at ? '☁ Tersinkron ' + hms(Sync.at) : '☁ Sinkron aktif') : savedAt ? '✓ Tersimpan otomatis ' + [savedAt.getHours(), savedAt.getMinutes(), savedAt.getSeconds()].map(n => String(n).padStart(2, '0')).join(':') : '💾 Tersimpan otomatis di browser ini';
 function commit(c) {
   if (loadFailed) fail('Data lama gagal dibuka. Pulihkan backup sebelum mengubah data.');
-  validate(c); const old = ls.get(KEY); if (old) ls.set(PREV, old); L = c; persist(); syncSoon();
+  validate(c); const old = ls.get(KEY), prev = L; if (old) ls.set(PREV, old); L = c; persist(); opQueue(prev, c);
 }
 function restore(l) { validate(l); if (!l.plans && L?.plans?.length) l.plans = L.plans; // estimates survive restoring an older backup
   loadFailed = false; ls.set('massok', '1'); commit(l); } // a restored backup may really remove many entries
@@ -822,7 +852,7 @@ async function login(raw) {
   else if (server) { L = server; persist(); ui.msg = `Selamat datang, ${name}. Data dimuat: ${L.entries.length} transaksi, ${L.wallets.length} dompet.`; }
   else { L = defaultLedger(); persist(); ui.msg = `Buku catatan baru dibuat untuk "${name}". Klik Tambah untuk mencatat transaksi pertama.`; }
   ui.locked = false; reminder();
-  syncStop(); if (syncCfg()) { setTimeout(syncNow, 0); Users.fileId(name).then(syncLive); }
+  syncStop(); if (syncCfg()) { setTimeout(opTick, 0); Users.fileId(name).then(syncLive); }
 }
 function logout() { syncStop(); Auth.forget(USER); GATE = null; USER = null; L = null; ui.locked = false; ui.menu = null; ui.msg = ''; ui.tx.search = ''; if (dlg().open) dlg().close(); }
 function reminder() {
@@ -1309,7 +1339,7 @@ function pickFile(accept, handler) { const i = document.createElement('input'); 
 const A = {
   nav: b => { ui.section = b.dataset.s; ui.menu = null; window.scrollTo(0, 0); },
   msgx: () => { ui.msg = ''; },
-  syncnow: async () => { Sync.rev = null; await syncNow(); ui.msg = Sync.err ? '' : 'Sudah tersinkron.'; }, new: () => entryDialog(null), more: () => { ui.tx.limit += 300; },
+  syncnow: async () => { Sync.force = true; await opFlush(); await syncNow(); ui.msg = Sync.err ? '' : 'Sudah tersinkron.'; }, new: () => entryDialog(null), more: () => { ui.tx.limit += 300; },
 
   eprev: () => { ui.est.month = addMonths(ui.est.month, -1); }, enext: () => { ui.est.month = addMonths(ui.est.month, 1); }, ethis: () => { ui.est.month = monthStart(new Date()); },
   padd: () => planDialog(null), pedit: b => planDialog((L.plans || []).find(x => x.id === b.dataset.id)),
@@ -1423,10 +1453,18 @@ window.addEventListener('storage', ev => {
   if (!USER || ev.key !== lk(KEY) || !ev.newValue) return;
   try { const l = JSON.parse(ev.newValue); validate(l); L = l; savedAt = new Date(); Sync.redraw = true; syncDraw(); } catch {}
 });
-// ---------- sync between devices (Supabase; one encrypted row per user, realtime broadcast + 15s check) ----------
+// ---------- sync between devices ----------
+// Fast path: every save sends only what changed (book_op_put, ~0.2 s, keepalive, so locking the phone right after saving does not lose it);
+// the server tells the other devices at once. Full copy (book_get/book_put through Drive, 500+ KB, 5–12 s) only for new devices,
+// big changes (restore, import) and now and then as a snapshot: it says in `opseq` up to which change it is complete.
 const SB_URL = 'https://ieyqxmzztoxgpvwexbkj.supabase.co', SB_KEY = 'sb_publishable_o-PQxhkJJ8FG4mHYTUqEBw_uXv9n-eG'; // Supabase project URL + anon (public) key
-const Sync = { busy: false, again: false, at: null, err: '', rev: null, ch: null, timer: null, redraw: false };
+const Sync = { busy: false, again: false, reading: false, at: null, err: '', ch: null, timer: null, redraw: false, force: false, full: false, noOps: false, mid: [], flushing: null, pulling: false, pullAgain: false };
 const BASE = 'syncbase2'; // what THIS device last agreed with the server; never leaves the device
+const QK = 'syncq';       // device-only too: { cur: last change applied, rev: last snapshot seen, snap: its opseq, box: changes not sent yet }
+const OP_MAX = 40, OP_BYTES = 16000, SNAP_EVERY = 30;
+function qGet() { try { return JSON.parse(ls.get(QK) || 'null') || {}; } catch { return {}; } }
+function qPut(q) { const t = JSON.stringify(q); if (ls.set(QK, t)) return true; ls.del(PREV); return ls.set(QK, t); }
+const pending = q => new Set((q.box || []).flatMap(b => b.c.map(changeKey)));
 // The merge base. Saved by this version, or else the one of the older version: another device's base could land there, so it is used with care.
 function syncBase() {
   let b = null; try { b = JSON.parse(ls.get(BASE) || 'null'); } catch {}
@@ -1439,10 +1477,11 @@ function syncCfg() { return !!(SB_URL && SB_KEY); }
 function showSync() { document.querySelectorAll('.save-state').forEach(el => { el.textContent = saveText(); }); }
 function syncSoon() { if (!syncCfg()) return; clearTimeout(Sync.timer); Sync.timer = setTimeout(syncNow, 300); showSync(); }
 async function rpc(fn, args) { // retries: some networks drop connections (flaky IPv6/NAT64)
-  for (let i = 0; ; i++) { try { return await rpcOnce(fn, args); } catch (e) { if (i >= 4 || /^server/.test(e.message)) throw e; await new Promise(r => setTimeout(r, 250 * (i + 1))); } }
+  for (let i = 0; ; i++) { try { return await rpcOnce(fn, args, i === 0); } catch (e) { if (i >= 4 || /^server/.test(e.message)) throw e; await new Promise(r => setTimeout(r, 250 * (i + 1))); } }
 }
-async function rpcOnce(fn, args) {
-  const r = await fetch(`${/^(book_(get|put|rev)|(nt|pl|cl|en|zh)_(list|put|admin))$/.test(fn) ? SB_URL + '/functions/v1/amatu-drive/rpc/' : SB_URL + '/rest/v1/rpc/'}${fn}`, { method: 'POST', cache: 'no-store', headers: { apikey: SB_KEY, Authorization: 'Bearer ' + SB_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+async function rpcOnce(fn, args, first) {
+  const body = JSON.stringify(args);
+  const r = await fetch(`${/^(book_(get|put|rev)|(nt|pl|cl|en|zh)_(list|put|admin))$/.test(fn) ? SB_URL + '/functions/v1/amatu-drive/rpc/' : SB_URL + '/rest/v1/rpc/'}${fn}`, { method: 'POST', cache: 'no-store', keepalive: !!first && fn === 'book_op_put' && body.length < 60000, /* keeps going when the phone locks; retries go without it in case a browser refuses it */ headers: { apikey: SB_KEY, Authorization: 'Bearer ' + SB_KEY, 'Content-Type': 'application/json' }, body });
   if (!r.ok) throw new Error(navigator.onLine ? 'server ' + r.status : 'offline'); return r.json();
 }
 let sbClient = null;
@@ -1450,41 +1489,148 @@ async function syncLive(id) {
   try {
     if (!window.supabase) await new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2'; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
     sbClient ||= window.supabase.createClient(SB_URL, SB_KEY);
-    if (Sync.ch) sbClient.removeChannel(Sync.ch);
-    Sync.ch = sbClient.channel('saku-' + id).on('broadcast', { event: 'rev' }, ({ payload }) => { if (payload?.rev !== Sync.rev) syncNow(); }).subscribe();
-  } catch {} // realtime is a bonus; the 15s check still syncs
+    if (Sync.ch) await sbClient.removeChannel(Sync.ch);
+    Sync.ch = sbClient.channel('saku-' + id)
+      .on('broadcast', { event: 'op' }, ({ payload }) => { if (USER && payload?.s > (qGet().cur ?? 0)) opPull(); })
+      .on('broadcast', { event: 'rev' }, ({ payload }) => { if (USER && payload?.rev !== qGet().rev) syncNow(); })
+      .subscribe();
+  } catch {} // realtime is a bonus; the 5s check still syncs
 }
-function syncStop() { if (Sync.ch && sbClient) sbClient.removeChannel(Sync.ch); Sync.ch = null; Sync.rev = null; Sync.at = null; Sync.err = ''; }
+function syncStop() { if (Sync.ch && sbClient) sbClient.removeChannel(Sync.ch); Sync.ch = null; Sync.at = null; Sync.err = ''; }
+// A save: remember what changed on this device first, then send it right away.
+function opQueue(prev, next) {
+  if (!syncCfg()) return;
+  const c = diffLedger(prev, next); if (!c.length) return;
+  const q = qGet();
+  if (Sync.noOps || q.cur == null || c.length > OP_MAX || JSON.stringify(c).length > OP_BYTES) { Sync.full = true; return syncSoon(); }
+  ls.del('massok'); (q.box ||= []).push({ o: uuid(), c });
+  if (!qPut(q)) { Sync.full = true; return syncSoon(); } // storage full: the full copy still carries it
+  opFlush(); showSync();
+}
+function opFlush() {
+  if (!USER || !syncCfg() || Sync.noOps) return Promise.resolve();
+  if (Sync.flushing) return Sync.flushing;
+  const user = USER; let sent = false;
+  const run = (async () => {
+    const id = await Users.fileId(user);
+    for (;;) {
+      if (USER !== user) return;
+      const box = qGet().box || []; if (!box.length) return;
+      const batch = []; let n = 0; for (const b of box) { const m = JSON.stringify(b.c).length; if (batch.length && (n + m > 30000 || batch.length >= 20)) break; n += m; batch.push(b); }
+      const ops = await Promise.all(batch.map(async b => ({ o: b.o, d: await Users.encrypt(user, JSON.stringify(b.c)) })));
+      await rpc('book_op_put', { p_id: id, p_ops: ops });
+      if (USER !== user) return;
+      const q = qGet(), done = new Set(batch.map(b => b.o)); q.box = (q.box || []).filter(b => !done.has(b.o)); qPut(q); sent = true;
+    }
+  })();
+  return Sync.flushing = run.catch(e => {
+    if (/^server (404|400)/.test(e?.message)) { Sync.noOps = true; Sync.full = true; syncSoon(); return; } // no fast path on this server: full copies, as before
+    Sync.err = e?.message || String(e); showSync(); clearTimeout(Sync.opRetry); Sync.opRetry = setTimeout(opFlush, 3000);
+  }).finally(() => { Sync.flushing = null; }).then(async () => {
+    if (sent && USER === user) { Sync.err = ''; Sync.at = new Date(); showSync(); await opPull(); }
+  });
+}
+async function opRead(id, after) { // all changes after `after`, decrypted, oldest first
+  const user = USER, ops = []; let cur = after, r;
+  for (let i = 0; i < 50; i++) {
+    r = await rpc('book_op_list', { p_id: id, p_after: cur });
+    for (const o of r.ops) { let c = null; try { c = JSON.parse(await Users.decrypt(user, o.d)); } catch {} ops.push({ s: o.s, c: Array.isArray(c) ? c : [] }); cur = o.s; }
+    if (r.ops.length < 200) break;
+  }
+  return { rev: r.rev ?? null, head: r.head, min: r.min ?? null, ops };
+}
+// Changes that came in: they go into the base and the book together. A record this device changed and has not sent yet stays as it is here.
+function opApply(ops) {
+  const q = qGet(), fresh = ops.filter(o => q.cur != null && o.s > q.cur); if (!fresh.length) return true;
+  const changes = fresh.flatMap(o => o.c), txt = ls.get(BASE); let base = null; try { base = JSON.parse(txt || 'null'); } catch {}
+  const next = applyOps(L, changes, pending(q));
+  try { try { validate(next); } catch { repairRefs(next, L, base); validate(next); } } catch { return false; } // leave it to the full merge
+  if (base) { const t = JSON.stringify(applyOps(base, changes)); if (!ls.set(BASE, t)) { ls.del(PREV); ls.set(BASE, t); } }
+  if (JSON.stringify(next) !== JSON.stringify(L)) { L = next; persist(); Sync.redraw = true; }
+  q.cur = fresh[fresh.length - 1].s; qPut(q);
+  if (Sync.busy) Sync.mid.push(...changes);
+  return true;
+}
+async function opPull() {
+  if (!USER || !L || !syncCfg() || Sync.noOps) return null;
+  if (Sync.pulling) { Sync.pullAgain = true; return null; }
+  const user = USER; Sync.pulling = true; let res = null;
+  try {
+    const q = qGet(); if (q.cur == null) return null;
+    const r = await opRead(await Users.fileId(user), q.cur);
+    if (USER !== user) return null;
+    if (Sync.reading) { Sync.pullAgain = true; return null; } // the full merge is reading now and takes these along itself
+    const gap = r.min != null && r.min > q.cur + 1, ok = gap || opApply(r.ops);
+    res = { rev: r.rev, head: r.head, again: gap || !ok }; Sync.at = new Date(); if (!Sync.opRetry || !(qGet().box || []).length) Sync.err = '';
+    syncDraw();
+  } catch (e) {
+    if (/^server (404|400)/.test(e?.message)) { Sync.noOps = true; return null; }
+    Sync.err = e?.message || String(e); showSync();
+  } finally { Sync.pulling = false; if (Sync.pullAgain && !Sync.reading) { Sync.pullAgain = false; setTimeout(opPull, 0); } }
+  return res;
+}
+// The regular check (every 5 s on screen, on wake): send, fetch, and do a full merge only when something needs it.
+function bookDirty() {
+  const t = JSON.stringify(L), b = ls.get(BASE) ?? ls.get('syncbase'); if (t === b) return false; if (!b) return true;
+  let base = null; try { base = JSON.parse(b); } catch { return true; }
+  if (diffLedger(L, base).length) return true;
+  if (ls.get(BASE) != null && !ls.set(BASE, t)) { ls.del(PREV); ls.set(BASE, t); }
+  return false;
+}
+async function opTick() {
+  if (!USER || !L || loadFailed || !syncCfg()) return;
+  if (Sync.noOps) return syncNow();
+  if (Sync.full || qGet().cur == null) { Sync.full = false; return syncNow(); }
+  await opFlush();
+  const r = await opPull(); if (!r) return;
+  const q = qGet();
+  const dirty = !q.box?.length && Date.now() - (Sync.lastFull || 0) > 60000 && bookDirty(); // at most once a minute: if the browser storage is full the base cannot be saved
+  if (r.again || r.rev !== q.rev || r.head - (q.snap || 0) >= SNAP_EVERY || dirty) syncNow();
+}
 async function syncNow() {
   if (!USER || !L || loadFailed || !syncCfg()) return;
   if (Sync.busy) { Sync.again = true; return; }
-  const user = USER; Sync.busy = true; showSync(); let changed = false, settled = false;
+  const user = USER; Sync.busy = true; Sync.full = false; Sync.lastFull = Date.now(); showSync(); let settled = false;
   try {
     const id = await Users.fileId(user);
+    await opFlush();
+    if (USER !== user) return;
     for (let tries = 0; tries < 4; tries++) {
-      const dirty = JSON.stringify(L) !== (ls.get(BASE) ?? ls.get('syncbase'));
-      if (!dirty && Sync.rev !== null && await rpc('book_rev', { p_id: id }) === Sync.rev) { settled = true; break; }
-      const row = (await rpc('book_get', { p_id: id }))[0]; let remote = null;
-      if (row && !row.data) { await new Promise(r => setTimeout(r, 700)); continue; } // the stored file was just replaced: read the new one
-      if (row) { remote = JSON.parse(await Users.decrypt(user, row.data)); validate(remote); }
+      const q0 = qGet(), dirty = bookDirty();
+      if (!dirty && !Sync.force && q0.rev != null && q0.cur != null && (await opPull().then(r => r ? r.head - (q0.snap || 0) < SNAP_EVERY : false)) && await rpc('book_rev', { p_id: id }) === q0.rev) { settled = true; break; }
+      Sync.reading = true;
+      const row = (await rpc('book_get', { p_id: id }))[0]; let remote = null, snap = 0;
+      if (row && !row.data) { Sync.reading = false; await new Promise(r => setTimeout(r, 700)); continue; } // the stored file was just replaced: read the new one
+      if (row) { remote = JSON.parse(await Users.decrypt(user, row.data)); snap = +remote.opseq || 0; delete remote.opseq; validate(remote); }
       if (USER !== user) return;
-      let base = syncBase();
-      if (!base) try { base = await serverLedger(true); } catch {}
+      let seed = null; if (!ls.get(BASE) && !ls.get('syncbase')) try { seed = await serverLedger(true); } catch {}
       if (USER !== user) return;
+      let log = { head: null, ops: [] };
+      if (!Sync.noOps) try { log = await opRead(id, snap); } catch (e) { if (/^server (404|400)/.test(e?.message)) Sync.noOps = true; else throw e; }
+      if (USER !== user) return;
+      // from here to the upload nothing else touches the book, so all copies are compared at the same point
+      opApply(log.ops); Sync.mid = [];
+      const all = log.ops.flatMap(o => o.c); if (remote && all.length) { remote = applyOps(remote, all); try { validate(remote); } catch { repairRefs(remote, L); validate(remote); } }
+      const base = syncBase() || seed; if (base) delete base.opseq; delete L.opseq;
       let merged = L;
-      if (remote) { merged = merge3(base, L, remote); try { validate(merged); } catch { repairRefs(merged, L, remote, base); validate(merged); } } // still invalid → stop here, both copies stay as they are
+      if (remote) { merged = merge3(base, L, remote); delete merged.opseq; try { validate(merged); } catch { repairRefs(merged, L, remote, base); validate(merged); } } // still invalid → stop here, both copies stay as they are
       const text = JSON.stringify(merged); let rev = row ? row.rev : 0;
-      if (text !== JSON.stringify(L)) { L = merged; persist(); changed = true; Sync.redraw = true; }
-      if (!remote || text !== JSON.stringify(remote)) {
-        const nr = await rpc('book_put', { p_id: id, p_data: await Users.encrypt(user, text), p_rev: rev });
+      if (text !== JSON.stringify(L)) { L = merged; persist(); Sync.redraw = true; }
+      Sync.reading = false;
+      const head = log.head, stale = head != null && head - snap >= SNAP_EVERY, put = !remote || text !== JSON.stringify(remote) || stale || Sync.force; let newSnap = snap;
+      if (put) {
+        const nr = await rpc('book_put', { p_id: id, p_data: await Users.encrypt(user, head != null ? JSON.stringify({ ...merged, opseq: head }) : text), p_rev: rev });
         if (nr === -1) continue; // someone saved in between: fetch and merge again
-        rev = nr; Sync.ch?.send({ type: 'broadcast', event: 'rev', payload: { rev } });
+        rev = nr; newSnap = head ?? 0; Sync.ch?.send({ type: 'broadcast', event: 'rev', payload: { rev } });
       }
-      Sync.rev = rev; saveBase(text); settled = true; break;
+      if (USER !== user) return;
+      saveBase(Sync.mid.length ? JSON.stringify(applyOps(merged, Sync.mid)) : text); Sync.mid = [];
+      const q = qGet(); q.rev = rev; q.snap = newSnap; if (head != null) q.cur = Math.max(q.cur ?? 0, head); qPut(q);
+      Sync.force = false; settled = true; break;
     }
     if (settled) { Sync.at = new Date(); Sync.err = ''; } else { Sync.err = 'belum berhasil, mencoba lagi'; Sync.again = true; }
   } catch (e) { Sync.err = e?.message || String(e); }
-  finally { Sync.busy = false; }
+  finally { Sync.busy = false; Sync.reading = false; if (Sync.pullAgain) { Sync.pullAgain = false; setTimeout(opPull, 0); } }
   if (Sync.again) { Sync.again = false; if (settled) return syncNow(); setTimeout(syncNow, 1500); }
   if (Sync.err) { clearTimeout(Sync.retry); Sync.retry = setTimeout(syncNow, 5000); }
   syncDraw();
@@ -1493,13 +1639,19 @@ function syncDraw() { // show what came in; the open dialog gets it when it clos
   if (Sync.redraw && USER && !ui.locked && !dlg().open) { Sync.redraw = false; render(); } else showSync();
 }
 dlg().addEventListener('close', () => setTimeout(syncDraw, 0));
-setInterval(() => { if (!document.hidden) syncNow(); }, 10000);
-function wakeSync() { if (document.hidden) return; syncNow(); if (USER && !dlg().open && !Sync.busy && Date.now() - lastUpdateCheck > 600000) { lastUpdateCheck = Date.now(); checkUpdate(); } }
+setInterval(() => { if (!document.hidden) opTick(); }, 5000);
+function wakeSync() {
+  if (document.hidden) { opFlush(); return; }
+  opTick();
+  if (USER && syncCfg() && (!Sync.ch || /closed|errored/.test(Sync.ch.state || ''))) Users.fileId(USER).then(syncLive); // the phone dropped the connection while it slept
+  if (USER && !dlg().open && !Sync.busy && Date.now() - lastUpdateCheck > 600000) { lastUpdateCheck = Date.now(); checkUpdate(); }
+}
 let lastUpdateCheck = Date.now();
 document.addEventListener('visibilitychange', wakeSync);
 window.addEventListener('focus', wakeSync);
 window.addEventListener('pageshow', wakeSync);
-window.addEventListener('online', () => syncNow());
+window.addEventListener('pagehide', () => { opFlush(); });
+window.addEventListener('online', () => opTick());
 boot();
 </script>
 </body>
