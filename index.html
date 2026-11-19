@@ -93,7 +93,8 @@ dialog h3{margin:0 0 16px;font-size:20px}
 .form>label{color:var(--muted)}
 .form input,.form select{width:100%}
 .err{color:var(--red);min-height:18px;margin-top:10px}
-.actions{display:flex;justify-content:space-between;margin-top:14px}
+.actions{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px}
+.auto-st{color:var(--accent);font-size:13px;font-weight:600;text-align:center;flex:1}
 .lock{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;z-index:50}
 .lock .box{text-align:center;display:grid;gap:14px;justify-items:center}
 .chart-x{font-size:10.5px;fill:var(--muted)}
@@ -775,7 +776,7 @@ function applyOps(l, changes, skip) {
 
 
 // Saku Web — UI
-const BUILD = '20261105-183941';
+const BUILD = '20261119-103751';
 // Phones keep old copies of the page in cache; when a newer build is online, load it (only on the login screen, so nothing is lost).
 async function checkUpdate() {
   try { const r = await fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' }); const m = /const BUILD = '([^']+)'/.exec(await r.text());
@@ -1046,8 +1047,13 @@ function vEstimate() {
 function planDialog(p) {
   const t = new Date(), m = ui.est.month; const def = m > monthStart(t) ? m : t;
   const cats = L.categories.filter(c => !c.income);
+  const id = p?.id || uuid(), orig = (L.plans || []).find(y => y.id === id);
+  const mk = (n, fd, final) => { const amount = parseAmount(fd.get('amount')); const ds = fd.get('date'); if (!ds) fail('Isi tanggal rencana.'); const d0 = fromDateInput(ds);
+    const x = { id, date: iso(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate(), 12)), amount, note: String(fd.get('note') || '').trim() };
+    const cid = final ? resolveCat(n, fd.get('catname'), false) : findCat(n, fd.get('catname'), false) || (String(fd.get('catname') || '').trim() ? (n.plans.find(y => y.id === id)?.category || '') : '');
+    if (cid) x.category = cid; return [x, d0]; };
   openDialog(`<h3>${p ? 'Edit rencana' : 'Tambah rencana pengeluaran'}</h3><p class="muted small" style="margin-top:0">Hanya untuk estimasi — tidak masuk ke laporan keuangan asli.</p>
-    <div class="form"><label>Nominal</label><input name="amount" class="money-in" inputmode="numeric" autocomplete="off" placeholder="mis. 10.000" value="${esc(fmtNum(p ? p.amount : ''))}">
+    <div class="form"><label>Nominal</label><input name="amount" class="money-in" inputmode="numeric" enterkeyhint="done" autocomplete="off" placeholder="mis. 10.000" value="${esc(fmtNum(p ? p.amount : ''))}">
     <label>Tanggal</label><input name="date" type="date" value="${dateInput(p ? p.date : def)}">
     <label>Kategori</label>${catInput(cats, p?.category ? categoryName(L, p.category) : '')}
     <label>Keterangan</label><input name="note" placeholder="mis. Cicilan motor, listrik, sekolah" value="${esc(p?.note || '')}"></div>
@@ -1055,13 +1061,18 @@ function planDialog(p) {
   (fd, how) => {
     const n = JSON.parse(JSON.stringify(L)); n.plans = n.plans || [];
     if (how === 'del') { if (!confirm('Hapus rencana ini?')) throw new Error('Batal menghapus.'); n.plans = n.plans.filter(x => x.id !== p.id); commit(n); ui.msg = 'Rencana dihapus.'; return; }
-    const amount = parseAmount(fd.get('amount')); const ds = fd.get('date'); if (!ds) fail('Isi tanggal rencana.'); const d0 = fromDateInput(ds);
-    const x = { id: p?.id || uuid(), date: iso(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate(), 12)), amount, note: String(fd.get('note') || '').trim() }; const cid = resolveCat(n, fd.get('catname'), false); if (cid) x.category = cid;
+    const [x, d0] = mk(n, fd, true);
     const i = n.plans.findIndex(y => y.id === x.id); if (i >= 0) n.plans[i] = x; else n.plans.push(x);
     if (how === 'copy') { const nm = addMonths(monthStart(d0), 1); const last = new Date(nm.getFullYear(), nm.getMonth() + 1, 0).getDate();
       n.plans.push({ ...x, id: uuid(), date: iso(new Date(nm.getFullYear(), nm.getMonth(), Math.min(d0.getDate(), last), 12)) }); ui.msg = `Rencana disalin ke ${monthName(nm)}.`; }
     else ui.msg = 'Rencana tersimpan (hanya estimasi).';
     commit(n); ui.est.month = monthStart(d0);
+  }, {
+    auto: fd => { if (!String(fd.get('amount') || '').trim() || !fd.get('date')) return false; const n = JSON.parse(JSON.stringify(L)); n.plans = n.plans || [];
+      const [x] = mk(n, fd, false); if (!(x.amount > 0)) return false; const i = n.plans.findIndex(y => y.id === x.id);
+      if (i >= 0 && same(n.plans[i], x)) return true;
+      if (i >= 0) n.plans[i] = x; else n.plans.push(x); commit(n); render(); return true; },
+    revert: () => { const n = JSON.parse(JSON.stringify(L)); n.plans = (n.plans || []).filter(y => y.id !== id); if (orig) n.plans.push(orig); commit(n); }
   });
 }
 
@@ -1092,7 +1103,7 @@ function showDetail(det) {
   const out = es.filter(x => x.kind === 'Pengeluaran').reduce((a, x) => a + x.amount, 0), inc = es.filter(x => x.kind === 'Pemasukan').reduce((a, x) => a + x.amount, 0);
   const groups = []; let cur = null; for (const e of es.slice(0, 1500)) { const k = +startOfDay(e.date); if (!cur || cur.k !== k) groups.push(cur = { k, list: [], out: 0, inc: 0 }); cur.list.push(e); if (e.kind === 'Pengeluaran') cur.out += e.amount; else if (e.kind === 'Pemasukan') cur.inc += e.amount; }
   const row = e => { const t = new Date(e.date); return `<button class="drow" data-da="edit" data-id="${e.id}"><span class="dt">${String(t.getHours()).padStart(2, '0')}.${String(t.getMinutes()).padStart(2, '0')}</span><span class="grow dn"><b>${esc(e.note || categoryName(L, e.category))}</b><small>${esc(e.category ? categoryName(L, e.category) : e.kind === 'Transfer' ? 'Transfer' : 'Tanpa kategori')}</small></span><span class="num ${e.kind === 'Pengeluaran' ? 'red' : 'acc'}">${e.kind === 'Pengeluaran' ? '−' : e.kind === 'Pemasukan' ? '+' : ''} ${money(e.amount)}</span></button>`; };
-  const d = dlg(); d.classList.add('wide');
+  const d = dlg(); d.classList.add('wide'); d._backdrop = d.oncancel = null;
   d.innerHTML = `<div class="dhead"><div><h3>${esc(det.title)}</h3><div class="muted">${es.length} transaksi${out ? ` · <span class="red">−${money(out)}</span>` : ''}${inc ? ` · <span class="acc">+${money(inc)}</span>` : ''}</div></div><button class="icon-btn xl" data-da="close" aria-label="Tutup">✕</button></div>
     <div class="dbody">${groups.length ? groups.map(g => `<div class="dgroup"><div class="dg-h"><span>${dayTitle(g.k)}</span><span>${g.out ? `<span class="red">−${money(g.out)}</span>` : ''}${g.inc ? ` <span class="acc">+${money(g.inc)}</span>` : ''}</span></div>${g.list.map(row).join('')}</div>`).join('') : '<div class="empty">Tidak ada transaksi.</div>'}
     ${es.length > 1500 ? `<p class="muted small">Menampilkan 1.500 dari ${es.length} transaksi terbaru.</p>` : ''}</div>
@@ -1262,15 +1273,49 @@ async function pinChange(old, nw) {
 
 // ---------- dialogs ----------
 const dlg = () => $('#dlg');
-function openDialog(html, onSubmit) {
+// Dialog form. Enter = Simpan (never the first button "Batal"). With opt.auto(fd) every field that changes
+// (leaving the field, picking a category, switching kind) is saved at once; tapping outside the dialog or Esc
+// saves and closes; "Batalkan perubahan" (opt.revert) undoes what was saved automatically. Simpan stays.
+function openDialog(html, onSubmit, opt = {}) {
   const d = dlg(); d.onclick = null; d.innerHTML = `<form method="dialog" id="dlg-form">${html}<div class="err" id="dlg-err"></div></form>`; d.showModal();
-  $('#dlg-form').onsubmit = async ev => { ev.preventDefault(); if (ev.submitter?.value === 'cancel') return d.close(); try { await onSubmit(new FormData(ev.target), ev.submitter?.value); d.close(); render(); } catch (e) { $('#dlg-err').textContent = e.message; } };
+  const f = $('#dlg-form'), st = { saved: false, t: 0, at: null }; const ok = () => f.querySelector('button[value=ok]');
+  const err = t => { const e = $('#dlg-err'); if (e) e.textContent = t; };
+  f.onsubmit = async ev => { ev.preventDefault(); clearTimeout(st.t); const how = ev.submitter?.value;
+    if (how === 'cancel') { if (st.saved && opt.revert) { try { opt.revert(); ui.msg = 'Perubahan dibatalkan.'; } catch (e) { err(e.message); return; } } d.close(); render(); return; }
+    try { await onSubmit(new FormData(f), how); d.close(); render(); } catch (e) { err(e.message); } };
+  f.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter' || ev.isComposing || ev.keyCode === 229 || ev.shiftKey || ev.altKey || /TEXTAREA|BUTTON/.test(ev.target.tagName)) return;
+    const c = ev.target.closest('.cat-combo');
+    if (c?.classList.contains('open')) { const on = c.querySelector('[data-catpick].on:not([hidden])'); if (on) ev.target.value = on.dataset.catpick; catMenu(c, false); }
+    const b = ok(); if (!b) return; ev.preventDefault(); f.requestSubmit(b);
+  });
+  d._backdrop = d.oncancel = null;
+  if (!opt.auto) return void setTimeout(() => d.querySelector('input:not([type=hidden]),select')?.focus(), 30);
+  const mark = () => { if (!st.saved) return; const c = f.querySelector('button[value=cancel]'); if (c && opt.revert) c.textContent = 'Batalkan perubahan';
+    let s = f.querySelector('.auto-st'); const a = f.querySelector('.actions');
+    if (!s && a) { s = document.createElement('span'); s.className = 'auto-st'; a.insertBefore(s, a.lastElementChild); }
+    if (s) s.textContent = '✓ Tersimpan otomatis ' + hms(st.at); };
+  const save = () => { clearTimeout(st.t); st.t = setTimeout(() => { if (!d.open || !f.isConnected) return;
+    let r = false; try { r = opt.auto(new FormData(f)); } catch (e) { r = false; }
+    if (r) { st.saved = true; st.at = new Date(); err(''); } mark(); }, 60); };
+  f.addEventListener('change', ev => { if (ev.target.name) save(); });
+  f.addEventListener('click', ev => { if (ev.target.closest('[data-catpick],[data-kind]')) setTimeout(save, 0); });
+  f.addEventListener('focusout', ev => { if (ev.target.name === 'catname' && !f.contains(ev.relatedTarget)) save(); });
+  // tap outside the dialog (the dimmed backdrop) = save and close; nothing typed yet = just close
+  d._backdrop = () => { const a = f.elements.amount; if (!st.saved && a && !a.value.trim()) { d.close(); return; } const b = ok(); if (b) f.requestSubmit(b); };
+  d.oncancel = ev => { if (!st.saved) return; ev.preventDefault(); const b = ok(); if (b) f.requestSubmit(b); };
   setTimeout(() => d.querySelector('input:not([type=hidden]),select')?.focus(), 30);
 }
+// clicks on the backdrop of a modal <dialog> are reported on the dialog itself; tell them apart from its padding
+document.addEventListener('click', ev => { const d = dlg(); if (!d?.open || ev.target !== d || !d._backdrop) return;
+  const r = d.getBoundingClientRect(); if (ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom) d._backdrop(); });
+const same = (a, b) => !!a && Object.keys({ ...a, ...b }).every(k => a[k] === b[k]);
+// existing category (case/space-insensitive) or '' — automatic saves never create categories (half-typed names)
+const findCat = (l, name, income) => { const k = String(name || '').trim().replace(/\s+/g, ' ').toLowerCase(); return k ? l.categories.find(x => x.income === income && x.name.trim().toLowerCase() === k)?.id || '' : ''; };
 const fmtNum = x => { const d = String(x ?? '').replace(/\D/g, '').replace(/^0+(?=\d)/, ''); return d.replace(/\B(?=(\d{3})+(?!\d))/g, '.'); };
 function catInput(cats, value) {
   const names = [...new Set(cats.map(c => c.name))].sort((a, b) => a.localeCompare(b, 'id'));
-  return `<div class="cat-combo"><input name="catname" autocomplete="off" placeholder="Ketik atau pilih kategori (kosong = tanpa kategori)" value="${esc(value)}"><button type="button" class="cat-dd" data-catdd aria-label="Tampilkan daftar kategori" title="Daftar kategori">▾</button>
+  return `<div class="cat-combo"><input name="catname" enterkeyhint="done" autocomplete="off" placeholder="Ketik atau pilih kategori (kosong = tanpa kategori)" value="${esc(value)}"><button type="button" class="cat-dd" data-catdd aria-label="Tampilkan daftar kategori" title="Daftar kategori">▾</button>
     <div class="cat-menu" hidden>${names.length ? names.map(n => `<button type="button" data-catpick="${esc(n)}">${esc(n)}</button>`).join('') : '<div class="muted small" style="padding:8px 10px">Belum ada kategori — ketik nama baru.</div>'}<div class="cat-none muted small" hidden style="padding:8px 10px">Tidak ada yang cocok — akan dibuat kategori baru.</div></div></div>`;
 }
 // category dropdown: ▾ toggles the full list, typing filters it, clicking an item fills the field
@@ -1278,6 +1323,7 @@ function catMenu(combo, show, filter) {
   const m = combo?.querySelector('.cat-menu'); if (!m) return; m.hidden = !show; combo.classList.toggle('open', show); if (!show) return;
   const q = String(filter || '').trim().toLowerCase(); let n = 0;
   m.querySelectorAll('[data-catpick]').forEach(b => { const ok = !q || b.dataset.catpick.toLowerCase().includes(q); b.hidden = !ok; if (ok) n++; b.classList.toggle('on', b.dataset.catpick.toLowerCase() === q); });
+  if (q && n === 1 && !m.querySelector('[data-catpick].on')) m.querySelector('[data-catpick]:not([hidden])')?.classList.add('on'); // Enter picks the only match
   const none = m.querySelector('.cat-none'); if (none) none.hidden = n > 0 || !m.querySelector('[data-catpick]');
   m.querySelector('[data-catpick].on')?.scrollIntoView({ block: 'nearest' });
 }
@@ -1310,20 +1356,31 @@ function entryDialog(existing, after) {
     const cats = L.categories.filter(c => c.income === (kind === 'Pemasukan')); const f = first ? null : $('#dlg-form'); first = false; const keep = f ? Object.fromEntries(new FormData(f)) : {}; if (keep.kind !== kind) delete keep.catname;
     const v = (k, d) => keep[k] ?? d;
     return `<h3>${existing ? 'Edit / ulangi transaksi' : 'Tambah transaksi'}</h3><div class="seg" style="margin-bottom:16px">${kinds.map(k => `<button type="button" data-kind="${k}" class="${k === kind ? 'on' : ''}">${k}</button>`).join('')}</div>
-      <div class="form"><input type="hidden" name="kind" value="${kind}"><label>Nominal</label><input name="amount" class="money-in" inputmode="numeric" autocomplete="off" placeholder="mis. 10.000" value="${esc(fmtNum(v('amount', existing ? existing.amount : '')))}">
+      <div class="form"><input type="hidden" name="kind" value="${kind}"><label>Nominal</label><input name="amount" class="money-in" inputmode="numeric" enterkeyhint="done" autocomplete="off" placeholder="mis. 10.000" value="${esc(fmtNum(v('amount', existing ? existing.amount : '')))}">
       <label>Tanggal dan waktu</label><input name="date" type="datetime-local" value="${esc(v('date', dtInput(when)))}">
       ${kind === 'Transfer' ? `<label>Dompet</label><select name="wallet">${L.wallets.map(w => opt(w.id, w.name, v('wallet', existing?.wallet) === w.id)).join('')}</select>` : `<input type="hidden" name="wallet" value="${esc(existing?.wallet || defaultWallet())}">`}
       ${kind === 'Transfer' ? `<label>Dompet tujuan</label><select name="destination">${opt('', 'Pilih dompet')}${L.wallets.map(w => opt(w.id, w.name, v('destination', existing?.destination) === w.id)).join('')}</select>`
         : `<label>Kategori</label>${catInput(cats, v('catname', existing?.category && existing.kind === kind ? categoryName(L, existing.category) : ''))}`}
-      <label>Catatan</label><input name="note" value="${esc(v('note', existing?.note || ''))}"></div>${dlgButtons()}`;
+      <label>Catatan</label><input name="note" enterkeyhint="done" value="${esc(v('note', existing?.note || ''))}"></div>${dlgButtons()}`;
+  };
+  const id = existing?.id || uuid(), orig = L.entries.find(x => x.id === id);
+  const build = (fd, final, base) => {
+    const w = fd.get('wallet'); const amount = parseAmount(fd.get('amount')); const d = new Date(fd.get('date')); if (isNaN(d)) fail('Tanggal tidak valid.');
+    const e = { id, date: iso(d), kind, amount, wallet: w, note: String(fd.get('note') || '') };
+    if (kind === 'Transfer') { const dest = fd.get('destination'); if (!dest) fail('Pilih dompet tujuan.'); if (dest === w) fail('Dompet tujuan harus berbeda.'); e.destination = dest; }
+    else if (String(fd.get('catname') || '').trim()) { const cid = final ? resolveCat(base, fd.get('catname'), kind === 'Pemasukan') : findCat(L, fd.get('catname'), kind === 'Pemasukan')
+        || (cur => cur?.kind === kind ? cur.category : '')(L.entries.find(x => x.id === id)); if (cid) e.category = cid; }
+    return [e, d];
   };
   openDialog(draw(), fd => {
-    const w = fd.get('wallet'); const amount = parseAmount(fd.get('amount')); const d = new Date(fd.get('date')); if (isNaN(d)) fail('Tanggal tidak valid.');
-    const e = { id: existing?.id || uuid(), date: iso(d), kind, amount, wallet: w, note: String(fd.get('note') || '') };
-    if (kind === 'Transfer') { const dest = fd.get('destination'); if (!dest) fail('Pilih dompet tujuan.'); if (dest === w) fail('Dompet tujuan harus berbeda.'); e.destination = dest; }
-    let base = L; if (kind !== 'Transfer' && String(fd.get('catname') || '').trim()) { base = JSON.parse(JSON.stringify(L)); const cid = resolveCat(base, fd.get('catname'), kind === 'Pemasukan'); if (cid) e.category = cid; }
+    let base = L; if (kind !== 'Transfer' && String(fd.get('catname') || '').trim()) base = JSON.parse(JSON.stringify(L));
+    const [e, d] = build(fd, true, base);
     commit(upsert(base, e)); if (ui.section === 'Transaksi') ui.day = startOfDay(d); const m = ui.msg = (existing ? 'Perubahan' : 'Transaksi') + ' tersimpan otomatis.'; setTimeout(() => { if (ui.msg === m) { ui.msg = ''; $('.msg')?.remove(); } }, 3000);
     if (after) setTimeout(() => { after(); render(); showDetail(ui._detail); }, 0);
+  }, {
+    auto: fd => { if (!String(fd.get('amount') || '').trim()) return false; const [e] = build(fd, false); if (!(e.amount > 0)) return false;
+      if (!same(L.entries.find(x => x.id === id), e)) { commit(upsert(L, e)); render(); } return true; },
+    revert: () => { commit(orig ? upsert(L, orig) : removeEntry(L, id)); }
   });
   dlg().onclick = ev => { const b = ev.target.closest('[data-kind]'); if (!b) return; kind = b.dataset.kind; const f = $('#dlg-form'); const html = draw(); f.innerHTML = html + '<div class="err" id="dlg-err"></div>'; };
 }
@@ -1412,6 +1469,7 @@ document.addEventListener('input', ev => { const el = ev.target; if (!el.classLi
   el.value = f; let i = 0, n = 0; while (i < f.length && n < before) { if (/\d/.test(f[i])) n++; i++; } try { el.setSelectionRange(i, i); } catch {} });
 document.addEventListener('input', ev => { const el = ev.target; if (el.dataset.bind && (el.type === 'text' || el.type === 'search')) bind(el); });
 document.addEventListener('keydown', ev => {
+  if (ev.key === 'Enter' && !ev.isComposing && !dlg().open && ev.target.matches?.('#c-name,#pin-old,#pin1,#pin2')) { ev.preventDefault(); run(ev.target.id === 'c-name' ? A.csave : A.pinset); return; }
   if (USER && !ui.locked && ui.section === 'Transaksi' && !dlg().open && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName || '') && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) { run(ev.key === 'ArrowLeft' ? A.dprev : A.dnext); return; } if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.matches?.('.metric.click')) { ev.preventDefault(); ev.target.click(); } if (ev.key === 'Escape' && ui.menu) { ui.menu = null; render(); } });
 function bind(el) {
   const [o, k] = el.dataset.bind.split('.'); ui[o][k] = el.type === 'checkbox' ? el.checked : el.value;
